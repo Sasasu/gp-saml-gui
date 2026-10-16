@@ -1,42 +1,60 @@
 #!/usr/bin/env python3
 
-import warnings
-try:
-    import gi
-
-    gi.require_version('Gtk', '3.0')
-    try:
-        gi.require_version('WebKit2', '4.1')
-    except ValueError:  # I wish this were ImportError
-        gi.require_version('WebKit2', '4.0')
-        warnings.warn("Using WebKit2Gtk 4.0 (obsolete); please upgrade to WebKit2Gtk 4.1")
-    from gi.repository import Gtk, WebKit2, GLib
-except ImportError:
-    try:
-        import pgi as gi
-        gi.require_version('Gtk', '3.0')
-        gi.require_version('WebKit2', '4.0')
-        from pgi.repository import Gtk, WebKit2, GLib
-        warnings.warn("Using PGI and WebKit2Gtk 4.0 (both obsolete); please upgrade to PyGObject and WebKit2Gtk 4.1")
-    except ImportError:
-        gi = None
-if gi is None:
-    raise ImportError("Either gi (PyGObject) or pgi (obsolete) module is required.")
-
 import argparse
+import base64
+import binascii
+import errno
+import os
+import secrets
+import socket
+import socketserver
+import struct
+import sys
+import threading
+import time
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 import urllib3
 import requests
 import xml.etree.ElementTree as ET
 import ssl
 import tempfile
+import subprocess
 
 from operator import setitem
 from os import path, dup2, execvp, environ
 from shlex import quote
 from sys import stderr, platform
-from binascii import a2b_base64, b2a_base64
-from urllib.parse import urlparse, urlencode, urlunsplit
+from binascii import a2b_base64
+from urllib.parse import unquote, urlparse, urlencode
 from html.parser import HTMLParser
+
+
+def load_webkit():
+    global Gtk, WebKit2, GLib
+    import warnings
+    try:
+        import gi
+
+        gi.require_version('Gtk', '3.0')
+        try:
+            gi.require_version('WebKit2', '4.1')
+        except ValueError:  # I wish this were ImportError
+            gi.require_version('WebKit2', '4.0')
+            warnings.warn("Using WebKit2Gtk 4.0 (obsolete); please upgrade to WebKit2Gtk 4.1")
+        from gi.repository import Gtk, WebKit2, GLib
+    except ImportError:
+        try:
+            import pgi as gi
+            gi.require_version('Gtk', '3.0')
+            gi.require_version('WebKit2', '4.0')
+            from pgi.repository import Gtk, WebKit2, GLib
+            warnings.warn("Using PGI and WebKit2Gtk 4.0 (both obsolete); please upgrade to PyGObject and WebKit2Gtk 4.1")
+        except ImportError:
+            gi = None
+    if gi is None:
+        raise ImportError("Either gi (PyGObject) or pgi (obsolete) module is required.")
 
 
 class CommentHtmlParser(HTMLParser):
@@ -51,9 +69,206 @@ class CommentHtmlParser(HTMLParser):
 COOKIE_FIELDS = ('prelogin-cookie', 'portal-userauthcookie')
 
 
+MAX_CALLBACK = 1024 * 1024
+FIELDS = ('saml-auth-status', 'saml-username', 'prelogin-cookie', 'portal-userauthcookie')
+DESKTOP_FILE = 'gp-saml-gui-browser.desktop'
+
+
+class EntryServer(socketserver.ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+
+def callback_address():
+    if not sys.platform.startswith('linux'):
+        raise ValueError('External browser callbacks currently require Linux.')
+    # Abstract Unix sockets leave no stale files and allow only one pending login
+    # per desktop user. Check peer credentials before reading a callback.
+    return '\0gp-saml-gui-{}'.format(os.getuid())
+
+
+def check_peer(connection):
+    _, uid, _ = struct.unpack('3i', connection.getsockopt(
+        socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
+    if uid != os.getuid():
+        raise ValueError('Browser callback peer belongs to another user.')
+
+
+class ResultParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.result = {}
+        self.field = None
+
+    def handle_starttag(self, tag, attrs):
+        self.field = tag if tag in FIELDS else None
+        if self.field:
+            self.result[self.field] = ''
+
+    def handle_endtag(self, tag):
+        self.field = None
+
+    def handle_data(self, data):
+        if self.field:
+            self.result[self.field] += data
+
+    def handle_comment(self, data):
+        parser = ResultParser()
+        parser.feed(data)
+        self.result.update(parser.result)
+
+
+def parse_callback(url):
+    if not url.startswith('globalprotectcallback:') or len(url) > MAX_CALLBACK:
+        raise ValueError('Invalid GlobalProtect callback URL.')
+    payload = unquote(url.split(':', 1)[1].lstrip('/'))
+    if payload.startswith('cas-as'):
+        raise ValueError('CAS token callbacks are not supported; use the embedded browser.')
+    try:
+        html = base64.b64decode(payload, validate=True).decode('utf-8')
+    except (binascii.Error, UnicodeError, ValueError):
+        raise ValueError('Invalid SAML callback encoding.') from None
+    parser = ResultParser()
+    parser.feed(html)
+    result = parser.result
+    if result.get('saml-auth-status') != '1':
+        raise ValueError('SAML authentication failed or callback has no success status.')
+    if not result.get('saml-username') or not any(result.get(k) for k in FIELDS[2:]):
+        raise ValueError('SAML callback is missing a username or VPN cookie.')
+    return result
+
+
+def send_callback(url):
+    # Validate before connecting, and never print the credential-bearing URL.
+    parse_callback(url)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(5)
+        try:
+            client.connect(callback_address())
+        except OSError:
+            raise ValueError('No pending gp-saml-gui browser login was found.') from None
+        check_peer(client)
+        client.sendall(url.encode('utf-8'))
+        client.shutdown(socket.SHUT_WR)
+        if client.recv(16) != b'OK':
+            raise ValueError('The pending login rejected the browser callback.')
+
+
+def install_handler():
+    callback_address()  # Check platform before making desktop changes.
+    # Desktop Exec quoting differs from shell quoting; % is a field-code escape.
+    def desktop_quote(value):
+        for char in ('\\', '"', '`', '$'):
+            value = value.replace(char, '\\' + char)
+        return '"' + value.replace('%', '%%') + '"'
+
+    script = str(Path(__file__).resolve())
+    command = ' '.join(desktop_quote(arg) for arg in (sys.executable, script))
+    data_home = Path(os.environ.get('XDG_DATA_HOME', str(Path.home() / '.local/share')))
+    applications = data_home / 'applications'
+    applications.mkdir(parents=True, exist_ok=True)
+    (applications / DESKTOP_FILE).write_text(
+        '[Desktop Entry]\nType=Application\nName=gp-saml-gui browser login\n'
+        'Exec={} --browser-callback %u\nNoDisplay=true\nTerminal=false\n'
+        'MimeType=x-scheme-handler/globalprotectcallback;\n'.format(command), encoding='utf-8')
+    subprocess.run(['xdg-mime', 'default', DESKTOP_FILE,
+                    'x-scheme-handler/globalprotectcallback'], check=True)
+    print('Registered gp-saml-gui for globalprotectcallback: URLs.', file=sys.stderr)
+
+
+def browser_login(uri, html, timeout, verbose):
+    address = callback_address()
+    handler = subprocess.run(['xdg-mime', 'query', 'default',
+                              'x-scheme-handler/globalprotectcallback'],
+                             check=True, stdout=subprocess.PIPE, universal_newlines=True)
+    #if handler.stdout.strip() != DESKTOP_FILE:
+    #    raise ValueError('Run gp-saml-gui --install-browser-handler before using --external.')
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        try:
+            listener.bind(address)
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                raise ValueError('Another gp-saml-gui browser login is already waiting.') from None
+            raise
+        listener.listen(4)
+        httpd = None
+        thread = None
+        try:
+            if html:
+                # Serve POST entry forms over loopback: browsers commonly block
+                # navigation to data: URLs passed from other applications.
+                entry_path = '/' + secrets.token_urlsafe(32)
+                content = html.encode('utf-8')
+
+                class EntryHandler(BaseHTTPRequestHandler):
+                    def do_GET(self):
+                        if self.path != entry_path:
+                            self.send_error(404)
+                            return
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'text/html; charset=utf-8')
+                        self.send_header('Content-Length', str(len(content)))
+                        self.send_header('Cache-Control', 'no-store')
+                        self.send_header('Referrer-Policy', 'no-referrer')
+                        self.end_headers()
+                        self.wfile.write(content)
+
+                    def log_message(self, *args):
+                        pass
+
+                httpd = EntryServer(('127.0.0.1', 0), EntryHandler)
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                uri = 'http://127.0.0.1:{}{}'.format(httpd.server_port, entry_path)
+            elif urlparse(uri).scheme not in ('http', 'https'):
+                raise ValueError('SAML entry point must be an HTTP or HTTPS URL.')
+            if verbose:
+                print('Opening the default browser. Complete login and allow it to open '
+                      'gp-saml-gui when prompted. Waiting up to {} seconds...'.format(timeout),
+                      file=sys.stderr)
+            deadline = time.monotonic() + timeout
+            if not webbrowser.open(uri, new=2):
+                raise ValueError('Could not open the default browser.')
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError('Browser login timed out. Check that the browser '
+                                       'allows globalprotectcallback: URLs and the VPN '
+                                       'supports default-browser SAML authentication.')
+                listener.settimeout(remaining)
+                try:
+                    client, _ = listener.accept()
+                except socket.timeout:
+                    continue
+                with client:
+                    data = bytearray()
+                    try:
+                        check_peer(client)
+                        while len(data) <= MAX_CALLBACK:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                break
+                            client.settimeout(min(5, remaining))
+                            chunk = client.recv(min(65536, MAX_CALLBACK + 1 - len(data)))
+                            if not chunk:
+                                break
+                            data.extend(chunk)
+                        result = parse_callback(data.decode('utf-8'))
+                        client.sendall(b'OK')
+                        return result
+                    except (OSError, ValueError):
+                        if verbose:
+                            print('Ignored an invalid browser callback.', file=sys.stderr)
+        finally:
+            if httpd is not None:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join()
+
+
 class SAMLLoginView:
     def __init__(self, uri, html, args):
 
+        load_webkit()
         Gtk.init(None)
         self.window = window = Gtk.Window()
 
@@ -263,7 +478,7 @@ def parse_args(args = None):
     default_clientos = pf2clientos.get(platform, 'Windows')
 
     p = argparse.ArgumentParser()
-    p.add_argument('server', help='GlobalProtect server (portal or gateway)')
+    p.add_argument('server', nargs='?', help='GlobalProtect server (portal or gateway)')
     p.add_argument('--no-verify', dest='verify', action='store_false', default=True, help='Ignore invalid server certificate')
     x = p.add_mutually_exclusive_group()
     x.add_argument('-C', '--cookies', default='~/.gp-saml-gui-cookies',
@@ -284,7 +499,13 @@ def parse_args(args = None):
     x.add_argument('-v','--verbose', default=1, action='count', help='Increase verbosity of explanatory output to stderr')
     x.add_argument('-q','--quiet', dest='verbose', action='store_const', const=0, help='Reduce verbosity to a minimum')
     x = p.add_mutually_exclusive_group()
-    x.add_argument('-x','--external', action='store_true', help='Launch external browser (for debugging)')
+    p.add_argument('-x', '--external', action='store_true',
+                   help='Log in using the default browser (Linux; requires browser callback handler)')
+    p.add_argument('--install-browser-handler', action='store_true',
+                   help='Register this program for globalprotectcallback: URLs and exit (Linux)')
+    p.add_argument('--browser-callback', metavar='URL', help=argparse.SUPPRESS)
+    p.add_argument('--browser-timeout', type=int, default=300,
+                   help='Seconds to wait for external browser login (default: %(default)s)')
     x.add_argument('-P','--pkexec-openconnect', action='store_const', dest='exec', const='pkexec', help='Use PolicyKit to exec openconnect')
     x.add_argument('-S','--sudo-openconnect', action='store_const', dest='exec', const='sudo', help='Use sudo to exec openconnect')
     x.add_argument('-E','--exec-openconnect', action='store_const', dest='exec', const='exec', help='Execute openconnect directly (advanced users)')
@@ -299,6 +520,13 @@ def parse_args(args = None):
     p.add_argument('--no-proxy', action='store_true', help='Disable system proxy settings')
     p.add_argument('openconnect_extra', nargs='*', help="Extra arguments to include in output OpenConnect command-line")
     args = p.parse_args(args)
+
+    if args.browser_timeout <= 0:
+        p.error('--browser-timeout must be positive')
+    if not args.server and not (args.install_browser_handler or args.browser_callback):
+        p.error('the following arguments are required: server')
+    if args.external and args.uri:
+        p.error('--external requires a GlobalProtect server hostname; --uri requires the embedded browser')
 
     args.ocos = clientos2ocos[args.clientos]
     args.extra = dict(x.split('=', 1) for x in args.extra)
@@ -320,6 +548,19 @@ def parse_args(args = None):
 def main(args = None):
     p, args = parse_args(args)
 
+    if args.install_browser_handler:
+        try:
+            install_handler()
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            p.error(str(exc))
+        return
+    if args.browser_callback:
+        try:
+            send_callback(args.browser_callback)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            p.error(str(exc))
+        return
+
     s = requests.Session()
     if args.insecure:
         s.mount('https://', TLSAdapter(verify=args.verify))
@@ -335,6 +576,8 @@ def main(args = None):
     else:
         endpoint = 'https://{}/{}'.format(args.server, if2prelogin[args.interface])
         data = {'tmp':'tmp', 'kerberos-support':'yes', 'ipv6-support':'yes', 'clientVer':4100, 'clientos':args.clientos, **args.extra}
+        if args.external:
+            data.setdefault('default-browser', '1')
         if args.verbose:
             print("Looking for SAML auth tags in response to %s..." % endpoint, file=stderr)
         try:
@@ -380,35 +623,37 @@ def main(args = None):
         else:
             p.error("Unknown SAML method (%s)" % sam)
 
-    # launch external browser for debugging
     if args.external:
-        print("Got SAML %s, opening external browser for debugging..." % sam, file=stderr)
-        import webbrowser
-        if html:
-            uri = 'data:text/html;base64,' + b2a_base64(html.encode()).decode()
-        webbrowser.open(uri)
-        raise SystemExit
-
-    # spawn WebKit view to do SAML interactive login
-    if args.verbose:
-        print("Got SAML %s, opening browser..." % sam, file=stderr)
-    slv = SAMLLoginView(uri, html, args)
-    Gtk.main()
-    if slv.closed:
-        print("Login window closed by user.", file=stderr)
-        p.exit(1)
-    if not slv.success:
-        p.error('''Login window closed without producing SAML cookies.''')
+        if not args.uri and xml.findtext('saml-default-browser', '').lower() != 'yes':
+            p.error('Server does not advertise default-browser SAML support; '
+                    'use the embedded browser or ask your VPN administrator to enable it.')
+        try:
+            saml_result = browser_login(uri, html, args.browser_timeout, args.verbose)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            p.error(str(exc))
+        except KeyboardInterrupt:
+            p.exit(1, 'Browser login cancelled.\n')
+    else:
+        if args.verbose:
+            print("Got SAML %s, opening browser..." % sam, file=stderr)
+        slv = SAMLLoginView(uri, html, args)
+        Gtk.main()
+        if slv.closed:
+            print("Login window closed by user.", file=stderr)
+            p.exit(1)
+        if not slv.success:
+            p.error('Login window closed without producing SAML cookies.')
+        saml_result = slv.saml_result
 
     # extract response and convert to OpenConnect command-line
-    un = slv.saml_result.get('saml-username')
+    un = saml_result.get('saml-username')
     if args.ignore_redirects:
         server = args.server
     else:
-        server = slv.saml_result.get('server', args.server)
+        server = saml_result.get('server', args.server)
 
     for cn, ifh in (('prelogin-cookie','gateway'), ('portal-userauthcookie','portal')):
-        cv = slv.saml_result.get(cn)
+        cv = saml_result.get(cn)
         if cv:
             break
     else:

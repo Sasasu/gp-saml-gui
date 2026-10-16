@@ -14,6 +14,7 @@ gp-saml-gui \- login to a GlobalProtect VPN that uses SAML authentication
 .OP -v
 .OP -q
 .OP -x
+.OP --browser-timeout SECONDS
 .OP -P
 .OP -S
 .OP -E
@@ -78,7 +79,19 @@ Increase verbosity of explanatory output to stderr
 Reduce verbosity to a minimum
 .IP
 .B -x, --external
-Launch external browser (for debugging)
+Log in using the default browser and receive the GlobalProtect SAML callback
+(Linux only). Requires a server advertising default-browser SAML support.
+May be combined with -P, -S, or -E.
+.IP
+.B --install-browser-handler
+Register this installation as the current user's handler for
+globalprotectcallback: URLs and exit. Run once before using --external.
+This replaces any other client's handler for the same URL scheme.
+.IP
+.B --browser-timeout SECONDS
+Seconds to wait for external browser authentication (default: 300).
+Press Ctrl+C to cancel. Only one external login can wait per user.
+The external browser manages its own cookies, certificates, and proxy settings.
 .IP
 .B -P, --pkexec-openconnect
 Use PolicyKit (\fBpkexec\fR) to exec openconnect

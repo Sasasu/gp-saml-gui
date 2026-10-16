@@ -12,6 +12,7 @@ Table of Contents
     * [Second, gp-saml-gui itself](#second-gp-saml-gui-itself)
   * [How to use](#how-to-use)
     * [Extra arguments to OpenConnect](#extra-arguments-to-openconnect)
+    * [Use your existing browser](#use-your-existing-browser)
   * [License](#license)
 
 Introduction
@@ -40,7 +41,9 @@ Installation
 First, non-Python Dependencies
 ------------------------------
 
-gp-saml-gui uses GTK, which requires Python 3 bindings.
+The default embedded browser uses GTK, which requires Python 3 bindings.
+The `--external` mode on Linux uses your default browser and `xdg-mime`
+(usually provided by `xdg-utils`); it does not require GTK or WebKit.
 
 On Debian / Ubuntu, these are packaged as `python3-gi`, `gir1.2-gtk-3.0`, and
 `gir1.2-webkit2-4.1` (or `gir1.2-webkit2-4.0` for older distributions).
@@ -82,6 +85,9 @@ usage: gp-saml-gui [-h] [--no-verify] [-C COOKIES | -K] [-p | -g] [-c CERT]
                    server [openconnect_extra [openconnect_extra ...]]
 gp-saml-gui: error: the following arguments are required: server, openconnect_extra
 ```
+
+For the embedded browser, also install PyGObject if your distribution has not
+already provided it: `pip3 install 'gp-saml-gui[gui]'`.
 
 How to use
 ==========
@@ -139,6 +145,63 @@ Launching OpenConnect with pkexec, equivalent to:
 <pkexec authentication dialog pops up>
 <openconnect runs>
 ```
+
+## Use your existing browser
+
+On Linux, `--external` opens a tab in your default browser, using that browser's
+existing profile and sign-in session. Register the login callback handler once,
+as your normal desktop user:
+
+```sh
+gp-saml-gui --install-browser-handler
+gp-saml-gui --external --gateway --clientos=Windows vpn.company.com
+```
+
+From a source checkout, use `python3 gp_saml_gui.py` in place of `gp-saml-gui`
+in both commands. Keep the checkout (or installed Python environment) in place
+after registering, since the desktop handler refers to its absolute path.
+If an older installation keeps asking you to register, run both commands using
+the same `python3 gp_saml_gui.py` path. Some `xdg-mime` versions misread quoted
+executable paths and report another client even when the handler is installed;
+rerun registration with the updated script to replace the desktop entry.
+The script warns about a mismatched handler and continues login.
+
+Complete login in the browser and allow it to open **gp-saml-gui browser login**
+when prompted. The terminal then outputs the usual `HOST`, `USER`, `COOKIE`, and
+`OS` variables. You can also combine `--external` with `-S`, `-P`, or `-E` to
+start OpenConnect automatically, for example:
+
+```sh
+gp-saml-gui --external -S --gateway --clientos=Windows vpn.company.com
+```
+
+The VPN must support and advertise default-browser SAML authentication
+(`<saml-default-browser>yes</saml-default-browser>`) and return a
+`globalprotectcallback:` URL containing the SAML username and VPN cookie.
+Servers which only return credentials in response headers or HTML comments
+require the embedded browser. CAS token-only callbacks are not supported.
+External mode requires a VPN server hostname and cannot be combined with `--uri`;
+the resulting OpenConnect command uses that hostname.
+Browser selection can depend on the
+[VPN administrator's configuration](https://docs.paloaltonetworks.com/globalprotect/administration/globalprotect-user-authentication/set-up-external-authentication/set-up-saml-authentication/enable-default-browser-for-saml-authentication-using-client-authentication-settings).
+
+Login times out after 300 seconds; change this with `--browser-timeout SECONDS`
+or press Ctrl+C to cancel. Only one external login may wait per Linux user.
+If the browser blocks the callback, you can pass the callback URL from another
+terminal with `gp-saml-gui --browser-callback 'globalprotectcallback:...'`.
+Treat that URL as a password.
+
+Registration changes the current user's handler for `globalprotectcallback:`;
+if you also use another GlobalProtect client, restore its handler using your
+desktop settings or `xdg-mime default CLIENT.desktop x-scheme-handler/globalprotectcallback`.
+To remove this registration, delete
+`~/.local/share/applications/gp-saml-gui-browser.desktop` (or the equivalent
+under `$XDG_DATA_HOME`).
+
+In external mode the browser manages its own cookies, certificates, user agent,
+and proxy settings. Options such as `--cookies`, `--no-cookies`, `--no-verify`,
+`--cert`, `--user-agent`, and `--no-proxy` do not configure the external browser;
+they still apply to the script or OpenConnect where supported.
 
 License
 =======
