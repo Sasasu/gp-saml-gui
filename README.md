@@ -13,6 +13,7 @@ Table of Contents
   * [How to use](#how-to-use)
     * [Extra arguments to OpenConnect](#extra-arguments-to-openconnect)
     * [Use your existing browser](#use-your-existing-browser)
+    * [Log in from another machine over SSH](#log-in-from-another-machine-over-ssh)
   * [License](#license)
 
 Introduction
@@ -202,6 +203,42 @@ In external mode the browser manages its own cookies, certificates, user agent,
 and proxy settings. Options such as `--cookies`, `--no-cookies`, `--no-verify`,
 `--cert`, `--user-agent`, and `--no-proxy` do not configure the external browser;
 they still apply to the script or OpenConnect where supported.
+
+## Log in from another machine over SSH
+
+Run `--remote` on the machine that should connect to the VPN. It needs Python,
+`requests`, and OpenConnect, but no desktop environment, GTK, or WebKit. Start
+an interactive SSH session from the machine with a browser:
+
+```sh
+ssh -tt -L 8765:127.0.0.1:8765 user@vpn-machine
+gp-saml-gui --remote -S --gateway --clientos=Windows vpn.company.com
+```
+
+Open the URL printed in the SSH terminal on the browser machine and complete
+the login there. When the browser reaches a `globalprotectcallback:` URL, copy
+the **complete URL** and paste it into the SSH terminal. The paste is not
+echoed. With `-S`, OpenConnect starts on the VPN machine after the callback is
+received. Keep the SSH session open if OpenConnect remains in the foreground.
+Without `-S` (or `-E`), the program prints the usual `HOST`, `USER`, `COOKIE`,
+and `OS` variables so you can start OpenConnect separately.
+
+The SSH `-L` forwarding is needed when the VPN sends a POST form as its SAML
+entry point. For a REDIRECT login, it is harmless and may be omitted. The
+temporary POST page is served only on the VPN machine's loopback interface,
+on port 8765 by default. If that port is busy, use `--entry-port PORT` and
+change both occurrences of 8765 in the SSH command to the same port. The
+URL includes a random path and expires when the login completes or times out.
+
+If the browser or another VPN client handles the callback scheme automatically,
+do not allow it to open that client; copy the callback URL from the browser's
+address bar or developer tools. The callback URL contains a VPN credential:
+do not put it in shell history, a command line, or a chat message. `--remote`
+requires a terminal and waits up to 300 seconds by default; set
+`--browser-timeout SECONDS` if needed. The VPN must advertise default-browser
+SAML support, as with `--external` above. CAS token callbacks and VPNs that
+return credentials only in response headers or HTML comments still require
+the embedded browser.
 
 License
 =======

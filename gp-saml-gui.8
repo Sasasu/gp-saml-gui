@@ -14,7 +14,9 @@ gp-saml-gui \- login to a GlobalProtect VPN that uses SAML authentication
 .OP -v
 .OP -q
 .OP -x
+.OP --remote
 .OP --browser-timeout SECONDS
+.OP --entry-port PORT
 .OP -P
 .OP -S
 .OP -E
@@ -83,15 +85,26 @@ Log in using the default browser and receive the GlobalProtect SAML callback
 (Linux only). Requires a server advertising default-browser SAML support.
 May be combined with -P, -S, or -E.
 .IP
+.B --remote
+Print the login URL for a browser on another machine and read the complete
+globalprotectcallback: URL privately from an interactive terminal. Requires
+default-browser SAML support. For POST entry forms, forward the entry port
+with SSH, for example: ssh -tt -L 8765:127.0.0.1:8765 user@vpn-machine.
+May be combined with -S or -E to run OpenConnect on the VPN machine.
+.IP
 .B --install-browser-handler
 Register this installation as the current user's handler for
 globalprotectcallback: URLs and exit. Run once before using --external.
 This replaces any other client's handler for the same URL scheme.
 .IP
 .B --browser-timeout SECONDS
-Seconds to wait for external browser authentication (default: 300).
+Seconds to wait for external or remote browser authentication (default: 300).
 Press Ctrl+C to cancel. Only one external login can wait per user.
 The external browser manages its own cookies, certificates, and proxy settings.
+.IP
+.B --entry-port PORT
+Loopback port for a remote POST login entry page (default: 8765).
+The SSH local forwarding port must match this value.
 .IP
 .B -P, --pkexec-openconnect
 Use PolicyKit (\fBpkexec\fR) to exec openconnect

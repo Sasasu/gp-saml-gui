@@ -5,6 +5,7 @@ import base64
 import binascii
 import errno
 import os
+import select
 import secrets
 import socket
 import socketserver
@@ -76,6 +77,33 @@ DESKTOP_FILE = 'gp-saml-gui-browser.desktop'
 
 class EntryServer(socketserver.ThreadingMixIn, HTTPServer):
     daemon_threads = True
+
+
+def start_entry_server(html, port=0):
+    # The entry page can contain SAML state, so expose it only over loopback.
+    entry_path = '/' + secrets.token_urlsafe(32)
+    content = html.encode('utf-8')
+
+    class EntryHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path != entry_path:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(content)))
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Referrer-Policy', 'no-referrer')
+            self.end_headers()
+            self.wfile.write(content)
+
+        def log_message(self, *args):
+            pass
+
+    httpd = EntryServer(('127.0.0.1', port), EntryHandler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    return httpd, thread, 'http://127.0.0.1:{}{}'.format(httpd.server_port, entry_path)
 
 
 def callback_address():
@@ -196,29 +224,7 @@ def browser_login(uri, html, timeout, verbose):
             if html:
                 # Serve POST entry forms over loopback: browsers commonly block
                 # navigation to data: URLs passed from other applications.
-                entry_path = '/' + secrets.token_urlsafe(32)
-                content = html.encode('utf-8')
-
-                class EntryHandler(BaseHTTPRequestHandler):
-                    def do_GET(self):
-                        if self.path != entry_path:
-                            self.send_error(404)
-                            return
-                        self.send_response(200)
-                        self.send_header('Content-Type', 'text/html; charset=utf-8')
-                        self.send_header('Content-Length', str(len(content)))
-                        self.send_header('Cache-Control', 'no-store')
-                        self.send_header('Referrer-Policy', 'no-referrer')
-                        self.end_headers()
-                        self.wfile.write(content)
-
-                    def log_message(self, *args):
-                        pass
-
-                httpd = EntryServer(('127.0.0.1', 0), EntryHandler)
-                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-                thread.start()
-                uri = 'http://127.0.0.1:{}{}'.format(httpd.server_port, entry_path)
+                httpd, thread, uri = start_entry_server(html)
             elif urlparse(uri).scheme not in ('http', 'https'):
                 raise ValueError('SAML entry point must be an HTTP or HTTPS URL.')
             if verbose:
@@ -263,6 +269,66 @@ def browser_login(uri, html, timeout, verbose):
                 httpd.shutdown()
                 httpd.server_close()
                 thread.join()
+
+
+def read_private_line(timeout):
+    # Read from the terminal rather than stdin, which may be used by eval or a
+    # pipeline. Never echo a callback URL containing a VPN cookie.
+    import termios
+    try:
+        tty = open('/dev/tty', 'rb', buffering=0)
+    except OSError:
+        raise ValueError('--remote needs an interactive terminal for the browser callback.') from None
+    with tty:
+        fd = tty.fileno()
+        old = termios.tcgetattr(fd)
+        hidden = termios.tcgetattr(fd)
+        hidden[3] &= ~termios.ECHO
+        data = bytearray()
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, hidden)
+            print('Paste the complete globalprotectcallback: URL, then press Enter: ',
+                  end='', file=sys.stderr, flush=True)
+            deadline = time.monotonic() + timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+                    raise TimeoutError('Remote browser login timed out.')
+                char = os.read(fd, 1)
+                if char in (b'\n', b'\r'):
+                    break
+                if not char:
+                    raise ValueError('Terminal closed before a browser callback was received.')
+                if len(data) >= MAX_CALLBACK:
+                    raise ValueError('Browser callback URL is too long.')
+                data.extend(char)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            print(file=sys.stderr)
+    try:
+        return data.decode('utf-8')
+    except UnicodeError:
+        raise ValueError('Browser callback URL is not valid UTF-8.') from None
+
+
+def remote_login(uri, html, timeout, port):
+    httpd = thread = None
+    try:
+        if html:
+            httpd, thread, uri = start_entry_server(html, port)
+            print('For a POST login, connect with SSH local forwarding: '
+                  '-L {0}:127.0.0.1:{0}'.format(port), file=sys.stderr)
+        elif urlparse(uri).scheme not in ('http', 'https'):
+            raise ValueError('SAML entry point must be an HTTP or HTTPS URL.')
+        print('Open this URL in your local browser:\n{}'.format(uri), file=sys.stderr)
+        print('After login, copy the complete globalprotectcallback: URL from the '
+              'browser and paste it below. Treat the URL as a password.', file=sys.stderr)
+        return parse_callback(read_private_line(timeout))
+    finally:
+        if httpd is not None:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join()
 
 
 class SAMLLoginView:
@@ -499,13 +565,18 @@ def parse_args(args = None):
     x.add_argument('-v','--verbose', default=1, action='count', help='Increase verbosity of explanatory output to stderr')
     x.add_argument('-q','--quiet', dest='verbose', action='store_const', const=0, help='Reduce verbosity to a minimum')
     x = p.add_mutually_exclusive_group()
-    p.add_argument('-x', '--external', action='store_true',
+    x.add_argument('-x', '--external', action='store_true',
                    help='Log in using the default browser (Linux; requires browser callback handler)')
+    x.add_argument('--remote', action='store_true',
+                   help='Print a login URL for another machine and read the callback from the terminal')
     p.add_argument('--install-browser-handler', action='store_true',
                    help='Register this program for globalprotectcallback: URLs and exit (Linux)')
     p.add_argument('--browser-callback', metavar='URL', help=argparse.SUPPRESS)
     p.add_argument('--browser-timeout', type=int, default=300,
-                   help='Seconds to wait for external browser login (default: %(default)s)')
+                   help='Seconds to wait for external or remote browser login (default: %(default)s)')
+    p.add_argument('--entry-port', type=int, default=8765,
+                   help='Loopback port for remote POST login over SSH forwarding (default: %(default)s)')
+    x = p.add_mutually_exclusive_group()
     x.add_argument('-P','--pkexec-openconnect', action='store_const', dest='exec', const='pkexec', help='Use PolicyKit to exec openconnect')
     x.add_argument('-S','--sudo-openconnect', action='store_const', dest='exec', const='sudo', help='Use sudo to exec openconnect')
     x.add_argument('-E','--exec-openconnect', action='store_const', dest='exec', const='exec', help='Execute openconnect directly (advanced users)')
@@ -523,10 +594,12 @@ def parse_args(args = None):
 
     if args.browser_timeout <= 0:
         p.error('--browser-timeout must be positive')
+    if not 1 <= args.entry_port <= 65535:
+        p.error('--entry-port must be between 1 and 65535')
     if not args.server and not (args.install_browser_handler or args.browser_callback):
         p.error('the following arguments are required: server')
-    if args.external and args.uri:
-        p.error('--external requires a GlobalProtect server hostname; --uri requires the embedded browser')
+    if (args.external or args.remote) and args.uri:
+        p.error('--external and --remote require a GlobalProtect server hostname; --uri requires the embedded browser')
 
     args.ocos = clientos2ocos[args.clientos]
     args.extra = dict(x.split('=', 1) for x in args.extra)
@@ -576,7 +649,7 @@ def main(args = None):
     else:
         endpoint = 'https://{}/{}'.format(args.server, if2prelogin[args.interface])
         data = {'tmp':'tmp', 'kerberos-support':'yes', 'ipv6-support':'yes', 'clientVer':4100, 'clientos':args.clientos, **args.extra}
-        if args.external:
+        if args.external or args.remote:
             data.setdefault('default-browser', '1')
         if args.verbose:
             print("Looking for SAML auth tags in response to %s..." % endpoint, file=stderr)
@@ -623,12 +696,15 @@ def main(args = None):
         else:
             p.error("Unknown SAML method (%s)" % sam)
 
-    if args.external:
+    if args.external or args.remote:
         if not args.uri and xml.findtext('saml-default-browser', '').lower() != 'yes':
             p.error('Server does not advertise default-browser SAML support; '
                     'use the embedded browser or ask your VPN administrator to enable it.')
         try:
-            saml_result = browser_login(uri, html, args.browser_timeout, args.verbose)
+            if args.remote:
+                saml_result = remote_login(uri, html, args.browser_timeout, args.entry_port)
+            else:
+                saml_result = browser_login(uri, html, args.browser_timeout, args.verbose)
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             p.error(str(exc))
         except KeyboardInterrupt:
